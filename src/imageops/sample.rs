@@ -112,9 +112,11 @@ pub enum FilterType {
 }
 
 /// A Representation of a separable filter.
-pub(crate) struct Filter<'a> {
-    /// The filter's filter function.
-    pub(crate) kernel: Box<dyn Fn(f32) -> f32 + 'a>,
+#[derive(Clone, Copy)]
+pub(crate) struct Filter {
+    /// The filter's kernel function.  All built-in kernels are plain `fn` items,
+    /// so this is a bare function pointer: `Copy + Send + Sync + 'static`.
+    pub(crate) kernel: fn(f32) -> f32,
 
     /// The window on which this filter operates.
     pub(crate) support: f32,
@@ -241,10 +243,11 @@ pub(crate) fn box_kernel(_x: f32) -> f32 {
 // Note: if an empty image is passed in, panics unless the image is truly empty.
 //
 // Note: this function processes pixels for the standard pixel types with up to 4 channels.
+#[cfg(not(feature = "rayon"))]
 fn horizontal_sample<P, S>(
     image: &Rgba32FImage,
     new_width: u32,
-    filter: &mut Filter,
+    filter: Filter,
 ) -> ImageBuffer<P, Vec<S>>
 where
     P: Pixel<Subpixel = S>,
@@ -324,6 +327,105 @@ where
             out.put_pixel(outx, y, pix_temp);
         }
     }
+
+    out
+}
+
+// Parallel version. Weights for all columns are packed into a single flat Vec<f32> (one
+// allocation, fits in L1/L2 cache), then each output row is computed independently.
+#[cfg(feature = "rayon")]
+fn horizontal_sample<P, S>(
+    image: &Rgba32FImage,
+    new_width: u32,
+    filter: Filter,
+) -> ImageBuffer<P, Vec<S>>
+where
+    P: Pixel<Subpixel = S> + Send + Sync,
+    S: Primitive + Send + Sync,
+{
+    use rayon::prelude::*;
+
+    let (width, height) = image.dimensions();
+    // This is protection against a memory usage similar to #2340. See `vertical_sample`.
+    assert!(
+        // Checks the implication: (width == 0) -> (height == 0)
+        width != 0 || height == 0,
+        "Unexpected prior allocation size. This case should have been handled by the caller"
+    );
+
+    let mut out = ImageBuffer::new(new_width, height);
+    out.copy_color_space_from(image);
+
+    let max: f32 = NumCast::from(S::DEFAULT_MAX_VALUE).unwrap();
+    let min: f32 = NumCast::from(S::DEFAULT_MIN_VALUE).unwrap();
+    let ratio = width as f32 / new_width as f32;
+    let sratio = if ratio < 1.0 { 1.0 } else { ratio };
+    let src_support = filter.support * sratio;
+
+    // Pack all column weights into one flat Vec<f32> (avoids new_width individual allocations).
+    // col_info[outx] = (left_source_pixel, offset_into_weights_flat, weight_count).
+    let mut weights_flat: Vec<f32> = Vec::new();
+    let mut col_info: Vec<(usize, usize, usize)> = Vec::with_capacity(new_width as usize);
+
+    for outx in 0..new_width {
+        let inputx = (outx as f32 + 0.5) * ratio;
+        let left = clamp(
+            (inputx - src_support).floor() as i64,
+            0,
+            <i64 as From<_>>::from(width) - 1,
+        ) as usize;
+        let right = clamp(
+            (inputx + src_support).ceil() as i64,
+            left as i64 + 1,
+            <i64 as From<_>>::from(width),
+        ) as usize;
+        let inputx = inputx - 0.5;
+
+        let start = weights_flat.len();
+        let mut sum = 0.0f32;
+        for i in left..right {
+            let w = (filter.kernel)((i as f32 - inputx) / sratio);
+            weights_flat.push(w);
+            sum += w;
+        }
+        for w in &mut weights_flat[start..] {
+            *w /= sum;
+        }
+        col_info.push((left, start, right - left));
+    }
+
+    // Borrow source samples as a flat slice; &[f32] is Sync.
+    let src_flat = image.as_flat_samples();
+    let src_samples: &[f32] = src_flat.samples;
+    let src_row_stride = width as usize * 4; // Rgba<f32>: 4 f32 per pixel
+    let out_channels = P::CHANNEL_COUNT as usize;
+    let out_row_stride = new_width as usize * out_channels;
+
+    // Parallelise over output rows; each row is independent.
+    out.as_flat_samples_mut()
+        .samples
+        .par_chunks_exact_mut(out_row_stride)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            let src_row_offset = y * src_row_stride;
+            for (outx, &(left, w_start, w_count)) in col_info.iter().enumerate() {
+                let mut t = [0.0f32; MAX_CHANNEL];
+                let ws = &weights_flat[w_start..w_start + w_count];
+                for (i, &w) in ws.iter().enumerate() {
+                    let src_offset = src_row_offset + (left + i) * 4;
+                    for (tc, &c) in t.iter_mut().zip(&src_samples[src_offset..src_offset + 4]) {
+                        *tc += c * w;
+                    }
+                }
+                let out_start = outx * out_channels;
+                for (k, oc) in out_row[out_start..out_start + out_channels]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *oc = NumCast::from(FloatNearest(clamp(t[k], min, max))).unwrap();
+                }
+            }
+        });
 
     out
 }
@@ -489,7 +591,8 @@ pub fn interpolate_bilinear<P: Pixel>(
 // preserved.
 //
 // Note: if an empty image is passed in, panics unless the image is truly empty.
-fn vertical_sample<I, P, S>(image: &I, new_height: u32, filter: &mut Filter) -> Rgba32FImage
+#[cfg(not(feature = "rayon"))]
+fn vertical_sample<I, P, S>(image: &I, new_height: u32, filter: Filter) -> Rgba32FImage
 where
     I: GenericImageView<Pixel = P>,
     P: Pixel<Subpixel = S>,
@@ -507,11 +610,12 @@ where
 
     let mut out = ImageBuffer::new(width, new_height);
     out.copy_color_space_from(&image.buffer_with_dimensions(0, 0));
-    let mut ws = Vec::new();
 
     let ratio = height as f32 / new_height as f32;
     let sratio = if ratio < 1.0 { 1.0 } else { ratio };
     let src_support = filter.support * sratio;
+
+    let mut ws = Vec::new();
 
     for outy in 0..new_height {
         // For an explanation of this algorithm, see the comments
@@ -555,6 +659,94 @@ where
             out.put_pixel(x, outy, pix);
         }
     }
+
+    out
+}
+
+// Parallel version: requires `I: Sync` so threads can call `image.get_pixel` concurrently.
+// Eliminates all intermediate allocations (no row_weights Vec, no src_data copy).
+// Uses a kernel-outer / x-inner loop to access each source row sequentially (row-major,
+// cache-friendly), accumulating directly into the output row slice.
+#[cfg(feature = "rayon")]
+fn vertical_sample<I, P, S>(image: &I, new_height: u32, filter: Filter) -> Rgba32FImage
+where
+    I: GenericImageView<Pixel = P> + Sync,
+    P: Pixel<Subpixel = S>,
+    S: Primitive,
+{
+    use rayon::prelude::*;
+
+    let (width, height) = image.dimensions();
+
+    assert!(
+        height != 0 || width == 0,
+        "Unexpected prior allocation size. This case should have been handled by the caller"
+    );
+
+    let mut out = ImageBuffer::new(width, new_height);
+    out.copy_color_space_from(&image.buffer_with_dimensions(0, 0));
+
+    let ratio = height as f32 / new_height as f32;
+    let sratio = if ratio < 1.0 { 1.0 } else { ratio };
+    let src_support = filter.support * sratio;
+    // `fn(f32) -> f32` is Copy + Send + Sync, safe to capture directly.
+    let kernel = filter.kernel;
+
+    // Parallelise over output rows; each row is fully independent.
+    out.as_flat_samples_mut()
+        .samples
+        .par_chunks_exact_mut(width as usize * 4)
+        .enumerate()
+        .for_each(|(outy, out_row)| {
+            let inputy = (outy as f32 + 0.5) * ratio;
+
+            let left = clamp(
+                (inputy - src_support).floor() as i64,
+                0,
+                <i64 as From<_>>::from(height) - 1,
+            ) as u32;
+            let right = clamp(
+                (inputy + src_support).ceil() as i64,
+                <i64 as From<_>>::from(left) + 1,
+                <i64 as From<_>>::from(height),
+            ) as u32;
+            let inputy = inputy - 0.5;
+
+            // Compute normalised weights (stack-allocated for small kernels).
+            let mut ws = Vec::with_capacity((right - left) as usize);
+            let mut sum = 0.0f32;
+            for i in left..right {
+                let w = kernel((i as f32 - inputy) / sratio);
+                ws.push(w);
+                sum += w;
+            }
+            for w in ws.iter_mut() {
+                *w /= sum;
+            }
+
+            // Initialise the output row: channels beyond P::CHANNEL_COUNT default to 1.0
+            // (preserves the original semantics, e.g. alpha=1 for opaque RGB sources).
+            for chunk in out_row.chunks_exact_mut(4) {
+                chunk[0] = 1.0;
+                chunk[1] = 1.0;
+                chunk[2] = 1.0;
+                chunk[3] = 1.0;
+            }
+
+            // Accumulate: iterate kernel taps in the outer loop so that, for each tap,
+            // all width pixels are read sequentially from one source row — row-major
+            // access avoids the cache-unfriendly column-major strides of the old approach.
+            for (i, &w) in ws.iter().enumerate() {
+                let src_y = left + i as u32;
+                for x in 0..width {
+                    let p = image.get_pixel(x, src_y);
+                    let base = x as usize * 4;
+                    for (oc, &c) in out_row[base..].iter_mut().zip(p.channels()) {
+                        *oc += <f32 as NumCast>::from(c).unwrap() * w;
+                    }
+                }
+            }
+        });
 
     out
 }
@@ -936,6 +1128,7 @@ where
 ///
 /// This method typically assumes that the input is scene-linear light.
 /// If it is not, color distortion may occur.
+#[cfg(not(feature = "rayon"))]
 pub fn resize<I: GenericImageView>(
     image: &I,
     nwidth: u32,
@@ -959,32 +1152,101 @@ pub fn resize<I: GenericImageView>(
         return tmp;
     }
 
-    let mut method = match filter {
+    let method = match filter {
         FilterType::Nearest => Filter {
-            kernel: Box::new(box_kernel),
+            kernel: box_kernel,
             support: 0.0,
         },
         FilterType::Triangle => Filter {
-            kernel: Box::new(triangle_kernel),
+            kernel: triangle_kernel,
             support: 1.0,
         },
         FilterType::CatmullRom => Filter {
-            kernel: Box::new(catmullrom_kernel),
+            kernel: catmullrom_kernel,
             support: 2.0,
         },
         FilterType::Gaussian => Filter {
-            kernel: Box::new(gaussian_kernel),
+            kernel: gaussian_kernel,
             support: 3.0,
         },
         FilterType::Lanczos3 => Filter {
-            kernel: Box::new(lanczos3_kernel),
+            kernel: lanczos3_kernel,
             support: 3.0,
         },
     };
 
     // Note: tmp is not necessarily actually Rgba
-    let tmp: Rgba32FImage = vertical_sample(image, nheight, &mut method);
-    horizontal_sample(&tmp, nwidth, &mut method)
+    let tmp: Rgba32FImage = vertical_sample(image, nheight, method);
+    horizontal_sample(&tmp, nwidth, method)
+}
+
+/// Resize the supplied image to the specified dimensions.
+///
+/// # Arguments:
+///
+/// * `nwidth` - new image width.
+/// * `nheight` - new image height.
+/// * `filter` -  is the sampling filter to use, see [FilterType] for mor information.
+///
+/// This method assumes alpha pre-multiplication for images that contain non-constant alpha.
+///
+/// This method typically assumes that the input is scene-linear light.
+/// If it is not, color distortion may occur.
+#[cfg(feature = "rayon")]
+pub fn resize<I: GenericImageView>(
+    image: &I,
+    nwidth: u32,
+    nheight: u32,
+    filter: FilterType,
+) -> ImageBuffer<I::Pixel, Vec<<I::Pixel as Pixel>::Subpixel>>
+where
+    I: Sync,
+    I::Pixel: Send + Sync,
+    <I::Pixel as Pixel>::Subpixel: Send + Sync,
+{
+    // Check if there is nothing to sample from.
+    let is_empty = {
+        let (width, height) = image.dimensions();
+        width == 0 || height == 0
+    };
+
+    if is_empty {
+        return image.buffer_with_dimensions(nwidth, nheight);
+    }
+
+    // check if the new dimensions are the same as the old. if they are, make a copy instead of resampling
+    if (nwidth, nheight) == image.dimensions() {
+        let mut tmp = image.buffer_like();
+        tmp.copy_from(image, 0, 0).unwrap();
+        return tmp;
+    }
+
+    let method = match filter {
+        FilterType::Nearest => Filter {
+            kernel: box_kernel,
+            support: 0.0,
+        },
+        FilterType::Triangle => Filter {
+            kernel: triangle_kernel,
+            support: 1.0,
+        },
+        FilterType::CatmullRom => Filter {
+            kernel: catmullrom_kernel,
+            support: 2.0,
+        },
+        FilterType::Gaussian => Filter {
+            kernel: gaussian_kernel,
+            support: 3.0,
+        },
+        FilterType::Lanczos3 => Filter {
+            kernel: lanczos3_kernel,
+            support: 3.0,
+        },
+    };
+
+    // Note: tmp is not necessarily actually Rgba
+    let tmp: Rgba32FImage = vertical_sample(image, nheight, method);
+    horizontal_sample(&tmp, nwidth, method)
 }
 
 /// Performs a Gaussian blur on the supplied image.
